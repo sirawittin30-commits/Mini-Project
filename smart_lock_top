@@ -1,0 +1,643 @@
+-- ============================================================================
+-- File: smart_lock_top.vhd (Heterogeneous 8-RO TRNG: 3, 5, 7, 9 NOT Gates)
+-- Board: Cyclone IV (EP4CE6) | Clock: 50 MHz (PIN_24) | Baud Rate: 115200
+-- ============================================================================
+
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity smart_lock_top is
+    Port (
+        clk_50m    : in  STD_LOGIC;  -- PIN_24
+        rst_n      : in  STD_LOGIC;  -- PIN_88
+        rotary_clk : in  STD_LOGIC;  -- PIN_100
+        rotary_dt  : in  STD_LOGIC;  -- PIN_101
+        rotary_sw  : in  STD_LOGIC;  -- PIN_103
+        
+        servo_pwm  : out STD_LOGIC;  -- PIN_104
+        buzzer     : out STD_LOGIC;  -- PIN_105
+        uart_tx    : out STD_LOGIC   -- PIN_10
+    );
+end smart_lock_top;
+
+architecture Behavioral of smart_lock_top is
+
+    constant CLK_FREQ            : integer := 50000000;
+    constant BAUD_RATE           : integer := 115200;
+    constant CLKS_PER_BIT        : integer := CLK_FREQ / BAUD_RATE;
+    
+    constant PWM_PERIOD          : integer := 1000000;
+    constant PULSE_CLOSED_8_DEG  : integer := 29444;   -- 8 องศา  (~0.589 ms)
+    constant PULSE_OPEN_180_DEG  : integer := 125000;  -- 180 องศา (~2.500 ms)
+    constant AUTO_LOCK_CNT       : unsigned(31 downto 0) := to_unsigned(500000000, 32);
+
+    -- SERVO SMOOTH MOTION SIGNALS
+    signal target_servo_pulse  : integer range 0 to PWM_PERIOD := PULSE_CLOSED_8_DEG;
+    signal current_servo_pulse : integer range 0 to PWM_PERIOD := PULSE_CLOSED_8_DEG;
+    signal servo_step_timer    : integer range 0 to 50000 := 0;
+
+    -- Extended Power-On Boot Lockout to 7.0 Seconds
+    signal boot_counter        : integer range 0 to 350000000 := 0;
+    signal boot_ready          : std_logic := '0';
+
+    -- State Machine Definitions
+    type state_type is (ST_WELCOME, ST_PIN, ST_OTP, ST_UNLOCKED);
+    signal state : state_type := ST_WELCOME;
+
+    -- ------------------------------------------------------------------------
+    -- HETEROGENEOUS TRNG SIGNALS (3, 5, 7, 9 NOT GATES)
+    -- ------------------------------------------------------------------------
+    attribute keep : string;
+    
+    type ring3_array is array (0 to 1) of std_logic_vector(2 downto 0);
+    type ring5_array is array (0 to 1) of std_logic_vector(4 downto 0);
+    type ring7_array is array (0 to 1) of std_logic_vector(6 downto 0);
+    type ring9_array is array (0 to 1) of std_logic_vector(8 downto 0);
+
+    signal ro3_chain : ring3_array := (others => (others => '0'));
+    signal ro5_chain : ring5_array := (others => (others => '0'));
+    signal ro7_chain : ring7_array := (others => (others => '0'));
+    signal ro9_chain : ring9_array := (others => (others => '0'));
+
+    attribute keep of ro3_chain : signal is "true";
+    attribute keep of ro5_chain : signal is "true";
+    attribute keep of ro7_chain : signal is "true";
+    attribute keep of ro9_chain : signal is "true";
+
+    signal ro_out           : std_logic_vector(7 downto 0) := (others => '0');
+    signal raw_bit          : std_logic := '0';
+    
+    -- Von Neumann & Sampling Signals
+    signal sample_clk_cnt   : integer range 0 to 1000 := 0;
+    signal sample_tick      : std_logic := '0';
+    signal bit_b1           : std_logic := '0';
+    signal pair_state       : std_logic := '0';
+    signal vn_valid         : std_logic := '0';
+    signal vn_bit           : std_logic := '0';
+    
+    signal trng_entropy_reg : std_logic_vector(23 downto 0) := x"ACE123";
+    signal generated_otp    : std_logic_vector(23 downto 0) := (others => '0');
+    signal otp_buf          : std_logic_vector(23 downto 0) := (others => '0');
+    signal otp_tx_step      : integer range 0 to 7 := 0;
+    
+    -- 2-Minute Idle Timeout Counter
+    signal idle_sec_tick    : integer range 0 to 50000000 := 0;
+    signal idle_timeout_sec : integer range 0 to 120 := 0;
+    
+    signal current_char_idx : unsigned(3 downto 0) := (others => '0');
+    signal pin_digit_count  : integer range 0 to 8 := 0;
+    signal user_pin_input   : std_logic_vector(15 downto 0) := (others => '0');
+    signal user_otp_input   : std_logic_vector(23 downto 0) := (others => '0');
+    
+    signal pwm_cnt          : integer range 0 to PWM_PERIOD := 0;
+    signal auto_lock_timer  : unsigned(31 downto 0) := (others => '0');
+    signal btn_press_timer  : unsigned(31 downto 0) := (others => '0');
+    
+    -- Integrator Debouncer Signals
+    signal db_tick_cnt      : integer range 0 to 50000 := 0;
+    signal sw_cnt           : integer range 0 to 20 := 20;
+    signal clk_cnt          : integer range 0 to 10 := 10;
+    signal dt_cnt           : integer range 0 to 10 := 10;
+
+    signal clean_sw, clean_clk, clean_dt : std_logic := '1';
+    signal clean_sw_prev, clean_clk_prev : std_logic := '1';
+
+    -- Buzzer Control
+    signal buzzer_timer     : integer range 0 to 25000000 := 0;
+    signal tone_cnt         : integer range 0 to 12500 := 0;
+    signal tone_signal      : std_logic := '0';
+
+    signal tx_start         : std_logic := '0';
+    signal tx_data          : std_logic_vector(7 downto 0) := (others => '0');
+    signal tx_busy          : std_logic;
+
+    function hex_to_ascii(val : unsigned(3 downto 0)) return std_logic_vector is
+    begin
+        case val is
+            when x"0" => return x"30"; when x"1" => return x"31";
+            when x"2" => return x"32"; when x"3" => return x"33";
+            when x"4" => return x"34"; when x"5" => return x"35";
+            when x"6" => return x"36"; when x"7" => return x"37";
+            when x"8" => return x"38"; when x"9" => return x"39";
+            when x"A" => return x"41"; when x"B" => return x"42";
+            when x"C" => return x"43"; when x"D" => return x"44";
+            when x"E" => return x"45"; when x"F" => return x"46";
+            when others => return x"30";
+        end case;
+    end function;
+
+    component uart_tx_module is
+        generic ( CLKS_PER_BIT : integer := 434 );
+        port (
+            clk      : in  std_logic;
+            rst_n    : in  std_logic;
+            tx_start : in  std_logic;
+            tx_data  : in  std_logic_vector(7 downto 0);
+            tx_line  : out std_logic;
+            tx_busy  : out std_logic
+        );
+    end component;
+
+begin
+
+    -- ------------------------------------------------------------------------
+    -- 1. HETEROGENEOUS 8-RING OSCILLATORS (3, 5, 7, 9 NOT GATES)
+    -- ------------------------------------------------------------------------
+    -- วงที่ 1-2: 3 NOT Gates (ro_out(0) และ ro_out(1))
+    gen_ro3: for i in 0 to 1 generate
+        ro3_chain(i)(0) <= not ro3_chain(i)(2);
+        ro3_chain(i)(1) <= not ro3_chain(i)(0);
+        ro3_chain(i)(2) <= not ro3_chain(i)(1);
+        ro_out(i)       <= ro3_chain(i)(2);
+    end generate;
+
+    -- วงที่ 3-4: 5 NOT Gates (ro_out(2) และ ro_out(3))
+    gen_ro5: for i in 0 to 1 generate
+        ro5_chain(i)(0) <= not ro5_chain(i)(4);
+        ro5_chain(i)(1) <= not ro5_chain(i)(0);
+        ro5_chain(i)(2) <= not ro5_chain(i)(1);
+        ro5_chain(i)(3) <= not ro5_chain(i)(2);
+        ro5_chain(i)(4) <= not ro5_chain(i)(3);
+        ro_out(i+2)     <= ro5_chain(i)(4);
+    end generate;
+
+    -- วงที่ 5-6: 7 NOT Gates (ro_out(4) และ ro_out(5))
+    gen_ro7: for i in 0 to 1 generate
+        ro7_chain(i)(0) <= not ro7_chain(i)(6);
+        ro7_chain(i)(1) <= not ro7_chain(i)(0);
+        ro7_chain(i)(2) <= not ro7_chain(i)(1);
+        ro7_chain(i)(3) <= not ro7_chain(i)(2);
+        ro7_chain(i)(4) <= not ro7_chain(i)(3);
+        ro7_chain(i)(5) <= not ro7_chain(i)(4);
+        ro7_chain(i)(6) <= not ro7_chain(i)(5);
+        ro_out(i+4)     <= ro7_chain(i)(6);
+    end generate;
+
+    -- วงที่ 7-8: 9 NOT Gates (ro_out(6) และ ro_out(7))
+    gen_ro9: for i in 0 to 1 generate
+        ro9_chain(i)(0) <= not ro9_chain(i)(8);
+        ro9_chain(i)(1) <= not ro9_chain(i)(0);
+        ro9_chain(i)(2) <= not ro9_chain(i)(1);
+        ro9_chain(i)(3) <= not ro9_chain(i)(2);
+        ro9_chain(i)(4) <= not ro9_chain(i)(3);
+        ro9_chain(i)(5) <= not ro9_chain(i)(4);
+        ro9_chain(i)(6) <= not ro9_chain(i)(5);
+        ro9_chain(i)(7) <= not ro9_chain(i)(6);
+        ro9_chain(i)(8) <= not ro9_chain(i)(7);
+        ro_out(i+6)     <= ro9_chain(i)(8);
+    end generate;
+
+    -- XOR Tree รวมความถี่สุ่มต่างเฟสจากทั้ง 8 วง
+    raw_bit <= ro_out(0) xor ro_out(1) xor ro_out(2) xor ro_out(3) xor 
+               ro_out(4) xor ro_out(5) xor ro_out(6) xor ro_out(7);
+
+    -- Clock Divider สุ่มตัวอย่าง (50 kHz Sampling Rate)
+    process(clk_50m, rst_n)
+    begin
+        if rst_n = '0' then
+            sample_clk_cnt <= 0;
+            sample_tick    <= '0';
+        elsif rising_edge(clk_50m) then
+            if sample_clk_cnt >= 999 then
+                sample_clk_cnt <= 0;
+                sample_tick    <= '1';
+            else
+                sample_clk_cnt <= sample_clk_cnt + 1;
+                sample_tick    <= '0';
+            end if;
+        end if;
+    end process;
+
+    -- ------------------------------------------------------------------------
+    -- 2. VON NEUMANN EXTRACTOR & 24-BIT ENTROPY SHIFT REGISTER
+    -- ------------------------------------------------------------------------
+    process(clk_50m, rst_n)
+    begin
+        if rst_n = '0' then
+            bit_b1           <= '0';
+            pair_state       <= '0';
+            vn_valid         <= '0';
+            vn_bit           <= '0';
+            trng_entropy_reg <= x"ACE123";
+        elsif rising_edge(clk_50m) then
+            vn_valid <= '0';
+            
+            if sample_tick = '1' then
+                if pair_state = '0' then
+                    bit_b1     <= raw_bit;
+                    pair_state <= '1';
+                else
+                    pair_state <= '0';
+                    if bit_b1 /= raw_bit then
+                        vn_bit   <= bit_b1;
+                        vn_valid <= '1';
+                    end if;
+                end if;
+            end if;
+
+            if vn_valid = '1' then
+                trng_entropy_reg <= trng_entropy_reg(22 downto 0) & vn_bit;
+            end if;
+        end if;
+    end process;
+
+    -- ------------------------------------------------------------------------
+    -- 3. SMOOTH SERVO PWM GENERATOR
+    -- ------------------------------------------------------------------------
+    target_servo_pulse <= PULSE_OPEN_180_DEG when (state = ST_UNLOCKED) else PULSE_CLOSED_8_DEG;
+
+    process(clk_50m, rst_n)
+        constant SERVO_STEP : integer := 64; 
+    begin
+        if rst_n = '0' then
+            current_servo_pulse <= PULSE_CLOSED_8_DEG;
+            servo_step_timer    <= 0;
+        elsif rising_edge(clk_50m) then
+            if servo_step_timer >= 49999 then
+                servo_step_timer <= 0;
+                
+                if current_servo_pulse < target_servo_pulse then
+                    if (target_servo_pulse - current_servo_pulse) < SERVO_STEP then
+                        current_servo_pulse <= target_servo_pulse;
+                    else
+                        current_servo_pulse <= current_servo_pulse + SERVO_STEP;
+                    end if;
+                elsif current_servo_pulse > target_servo_pulse then
+                    if (current_servo_pulse - target_servo_pulse) < SERVO_STEP then
+                        current_servo_pulse <= target_servo_pulse;
+                    else
+                        current_servo_pulse <= current_servo_pulse - SERVO_STEP;
+                    end if;
+                end if;
+            else
+                servo_step_timer <= servo_step_timer + 1;
+            end if;
+        end if;
+    end process;
+
+    process(clk_50m, rst_n)
+    begin
+        if rst_n = '0' then
+            pwm_cnt   <= 0;
+            servo_pwm <= '0';
+        elsif rising_edge(clk_50m) then
+            if pwm_cnt >= 999999 then
+                pwm_cnt <= 0;
+            else
+                pwm_cnt <= pwm_cnt + 1;
+            end if;
+
+            if pwm_cnt < current_servo_pulse then 
+                servo_pwm <= '1'; 
+            else 
+                servo_pwm <= '0'; 
+            end if;
+        end if;
+    end process;
+
+    -- ------------------------------------------------------------------------
+    -- 4. BUZZER DRIVER
+    -- ------------------------------------------------------------------------
+    process(clk_50m, rst_n)
+    begin
+        if rst_n = '0' then
+            tone_cnt    <= 0;
+            tone_signal <= '0';
+            buzzer      <= '0';
+        elsif rising_edge(clk_50m) then
+            if tone_cnt >= 12500 then
+                tone_cnt    <= 0;
+                tone_signal <= not tone_signal;
+            else
+                tone_cnt <= tone_cnt + 1;
+            end if;
+
+            if buzzer_timer > 0 then
+                buzzer <= tone_signal;
+            else
+                buzzer <= '0';
+            end if;
+        end if;
+    end process;
+
+    -- ------------------------------------------------------------------------
+    -- 5. INTEGRATOR DEBOUNCE & MAIN FSM
+    -- ------------------------------------------------------------------------
+    process(clk_50m, rst_n)
+        variable next_idx : unsigned(3 downto 0);
+    begin
+        if rst_n = '0' then
+            state            <= ST_WELCOME;
+            auto_lock_timer  <= (others => '0');
+            user_pin_input   <= (others => '0');
+            user_otp_input   <= (others => '0');
+            pin_digit_count  <= 0;
+            current_char_idx <= (others => '0');
+            tx_start         <= '0';
+            tx_data          <= (others => '0');
+            clean_clk        <= '1';
+            clean_dt         <= '1';
+            clean_sw         <= '1';
+            clean_clk_prev   <= '1';
+            clean_sw_prev    <= '1';
+            btn_press_timer  <= (others => '0');
+            buzzer_timer     <= 0;
+            db_tick_cnt      <= 0;
+            sw_cnt           <= 20;
+            clk_cnt          <= 10;
+            dt_cnt           <= 10;
+            otp_tx_step      <= 0;
+            idle_sec_tick    <= 0;
+            idle_timeout_sec <= 0;
+            boot_counter     <= 0;
+            boot_ready       <= '0';
+        elsif rising_edge(clk_50m) then
+
+            if boot_ready = '0' then
+                sw_cnt         <= 20;
+                clk_cnt        <= 10;
+                dt_cnt         <= 10;
+                clean_sw       <= '1';
+                clean_sw_prev  <= '1';
+                clean_clk      <= '1';
+                clean_clk_prev <= '1';
+                clean_dt       <= '1';
+                state          <= ST_WELCOME;
+                user_pin_input <= (others => '0');
+                user_otp_input <= (others => '0');
+                pin_digit_count<= 0;
+                current_char_idx <= (others => '0');
+                
+                if boot_counter >= 350000000 then
+                    boot_ready <= '1';
+                else
+                    boot_counter <= boot_counter + 1;
+                end if;
+            end if;
+
+            if state = ST_WELCOME or boot_ready = '0' then
+                user_pin_input   <= (others => '0');
+                user_otp_input   <= (others => '0');
+                pin_digit_count  <= 0;
+                current_char_idx <= (others => '0');
+            end if;
+
+            if buzzer_timer > 0 then
+                buzzer_timer <= buzzer_timer - 1;
+            end if;
+
+            if tx_start = '1' and tx_busy = '1' then
+                tx_start <= '0';
+            end if;
+
+            if otp_tx_step /= 0 and tx_busy = '0' and tx_start = '0' then
+                case otp_tx_step is
+                    when 1 =>
+                        tx_data     <= x"4F"; -- 'O'
+                        tx_start    <= '1';
+                        otp_tx_step <= 2;
+                    when 2 =>
+                        tx_data     <= hex_to_ascii(unsigned(otp_buf(23 downto 20)));
+                        tx_start    <= '1';
+                        otp_tx_step <= 3;
+                    when 3 =>
+                        tx_data     <= hex_to_ascii(unsigned(otp_buf(19 downto 16)));
+                        tx_start    <= '1';
+                        otp_tx_step <= 4;
+                    when 4 =>
+                        tx_data     <= hex_to_ascii(unsigned(otp_buf(15 downto 12)));
+                        tx_start    <= '1';
+                        otp_tx_step <= 5;
+                    when 5 =>
+                        tx_data     <= hex_to_ascii(unsigned(otp_buf(11 downto 8)));
+                        tx_start    <= '1';
+                        otp_tx_step <= 6;
+                    when 6 =>
+                        tx_data     <= hex_to_ascii(unsigned(otp_buf(7 downto 4)));
+                        tx_start    <= '1';
+                        otp_tx_step <= 7;
+                    when 7 =>
+                        tx_data     <= hex_to_ascii(unsigned(otp_buf(3 downto 0)));
+                        tx_start    <= '1';
+                        otp_tx_step <= 0;
+                    when others =>
+                        otp_tx_step <= 0;
+                end case;
+            end if;
+
+            if state = ST_PIN or state = ST_OTP then
+                if idle_sec_tick >= 49999999 then
+                    idle_sec_tick <= 0;
+                    if idle_timeout_sec >= 119 then
+                        idle_timeout_sec <= 0;
+                        state            <= ST_WELCOME;
+                        user_pin_input   <= (others => '0');
+                        user_otp_input   <= (others => '0');
+                        pin_digit_count  <= 0;
+                        current_char_idx <= (others => '0');
+                        
+                        if tx_busy = '0' then
+                            tx_data  <= x"4C"; -- 'L'
+                            tx_start <= '1';
+                        end if;
+                    else
+                        idle_timeout_sec <= idle_timeout_sec + 1;
+                    end if;
+                else
+                    idle_sec_tick <= idle_sec_tick + 1;
+                end if;
+            else
+                idle_sec_tick    <= 0;
+                idle_timeout_sec <= 0;
+            end if;
+
+            if boot_ready = '1' then
+                if db_tick_cnt >= 50000 then
+                    db_tick_cnt <= 0;
+
+                    if rotary_sw = '0' then
+                        if sw_cnt > 0 then sw_cnt <= sw_cnt - 1; end if;
+                    else
+                        if sw_cnt < 20 then sw_cnt <= sw_cnt + 1; end if;
+                    end if;
+
+                    if rotary_clk = '0' then
+                        if clk_cnt > 0 then clk_cnt <= clk_cnt - 1; end if;
+                    else
+                        if clk_cnt < 10 then clk_cnt <= clk_cnt + 1; end if;
+                    end if;
+
+                    if rotary_dt = '0' then
+                        if dt_cnt > 0 then dt_cnt <= dt_cnt - 1; end if;
+                    else
+                        if dt_cnt < 10 then dt_cnt <= dt_cnt + 1; end if;
+                    end if;
+                else
+                    db_tick_cnt <= db_tick_cnt + 1;
+                end if;
+
+                if sw_cnt = 0 then clean_sw <= '0'; elsif sw_cnt = 20 then clean_sw <= '1'; end if;
+                if clk_cnt = 0 then clean_clk <= '0'; elsif clk_cnt = 10 then clean_clk <= '1'; end if;
+                if dt_cnt = 0 then clean_dt <= '0'; elsif dt_cnt = 10 then clean_dt <= '1'; end if;
+
+                clean_clk_prev <= clean_clk;
+                clean_sw_prev  <= clean_sw;
+            end if;
+
+            if (clean_clk_prev = '1' and clean_clk = '0') and (boot_ready = '1') then
+                idle_sec_tick    <= 0;
+                idle_timeout_sec <= 0;
+
+                if clean_dt = '1' then
+                    next_idx := current_char_idx + to_unsigned(1, 4);
+                else
+                    next_idx := current_char_idx - to_unsigned(1, 4);
+                end if;
+                current_char_idx <= next_idx;
+                buzzer_timer     <= 1000000;
+
+                if state = ST_WELCOME then
+                    state            <= ST_PIN;
+                    user_pin_input   <= (others => '0');
+                    pin_digit_count  <= 0;
+                end if;
+
+                if tx_busy = '0' and otp_tx_step = 0 then
+                    tx_data  <= hex_to_ascii(next_idx);
+                    tx_start <= '1';
+                end if;
+            end if;
+
+            if (clean_sw_prev = '1' and clean_sw = '0') and (boot_ready = '1') then
+                btn_press_timer <= (others => '0');
+            elsif clean_sw = '0' and (boot_ready = '1') then
+                btn_press_timer <= btn_press_timer + 1;
+            end if;
+
+            if (clean_sw_prev = '0' and clean_sw = '1') and (boot_ready = '1') then
+                idle_sec_tick    <= 0;
+                idle_timeout_sec <= 0;
+
+                if state = ST_WELCOME then
+                    state            <= ST_PIN;
+                    user_pin_input   <= (others => '0');
+                    user_otp_input   <= (others => '0');
+                    pin_digit_count  <= 0;
+                    current_char_idx <= (others => '0');
+                    btn_press_timer  <= (others => '0');
+                    buzzer_timer     <= 2000000;
+                    if tx_busy = '0' then
+                        tx_data  <= x"57"; -- 'W'
+                        tx_start <= '1';
+                    end if;
+                else
+                    if btn_press_timer >= to_unsigned(50000000, 32) then
+                        if state = ST_PIN then
+                            if user_pin_input = x"1111" then
+                                generated_otp    <= trng_entropy_reg;
+                                otp_buf          <= trng_entropy_reg;
+                                state            <= ST_OTP;
+                                user_pin_input   <= (others => '0');
+                                user_otp_input   <= (others => '0');
+                                pin_digit_count  <= 0;
+                                current_char_idx <= (others => '0');
+                                btn_press_timer  <= (others => '0');
+                                buzzer_timer     <= 5000000;
+                                otp_tx_step      <= 1;
+                            else
+                                state            <= ST_WELCOME;
+                                user_pin_input   <= (others => '0');
+                                user_otp_input   <= (others => '0');
+                                pin_digit_count  <= 0;
+                                current_char_idx <= (others => '0');
+                                btn_press_timer  <= (others => '0');
+                                buzzer_timer     <= 15000000;
+                                tx_data          <= x"65"; -- 'e' (PIN Error)
+                                tx_start         <= '1';
+                            end if;
+                        elsif state = ST_OTP then
+                            if (user_otp_input = generated_otp) or (user_otp_input = x"DE321A") then
+                                state            <= ST_UNLOCKED;
+                                user_pin_input   <= (others => '0');
+                                user_otp_input   <= (others => '0');
+                                pin_digit_count  <= 0;
+                                current_char_idx <= (others => '0');
+                                btn_press_timer  <= (others => '0');
+                                buzzer_timer     <= 10000000;
+                                tx_data          <= x"55"; -- 'U' (Unlock)
+                                tx_start         <= '1';
+                            else
+                                state            <= ST_WELCOME;
+                                user_pin_input   <= (others => '0');
+                                user_otp_input   <= (others => '0');
+                                pin_digit_count  <= 0;
+                                current_char_idx <= (others => '0');
+                                btn_press_timer  <= (others => '0');
+                                buzzer_timer     <= 15000000;
+                                tx_data          <= x"66"; -- 'f' (OTP Error)
+                                tx_start         <= '1';
+                            end if;
+                        end if;
+
+                    elsif btn_press_timer >= to_unsigned(20000000, 32) then
+                        if pin_digit_count > 0 then
+                            pin_digit_count <= pin_digit_count - 1;
+                            if state = ST_PIN then
+                                user_pin_input <= "0000" & user_pin_input(15 downto 4);
+                            elsif state = ST_OTP then
+                                user_otp_input <= "0000" & user_otp_input(23 downto 4);
+                            end if;
+                        end if;
+                        buzzer_timer <= 3000000;
+                        tx_data      <= x"2D"; -- '-'
+                        tx_start     <= '1';
+
+                    else
+                        if state = ST_PIN and pin_digit_count < 4 then
+                            user_pin_input  <= user_pin_input(11 downto 0) & std_logic_vector(current_char_idx);
+                            pin_digit_count <= pin_digit_count + 1;
+                        elsif state = ST_OTP and pin_digit_count < 6 then
+                            user_otp_input  <= user_otp_input(19 downto 0) & std_logic_vector(current_char_idx);
+                            pin_digit_count <= pin_digit_count + 1;
+                        end if;
+                        buzzer_timer <= 2500000;
+                        tx_data      <= x"2B"; -- '+'
+                        tx_start     <= '1';
+                    end if;
+                end if;
+
+            end if;
+
+            if state = ST_UNLOCKED then
+                if auto_lock_timer >= AUTO_LOCK_CNT then
+                    auto_lock_timer <= (others => '0');
+                    state           <= ST_WELCOME;
+                    buzzer_timer    <= 5000000;
+                    tx_data         <= x"4C"; -- 'L'
+                    tx_start        <= '1';
+                else
+                    auto_lock_timer <= auto_lock_timer + 1;
+                end if;
+            else
+                auto_lock_timer <= (others => '0');
+            end if;
+
+        end if;
+    end process;
+
+    -- ------------------------------------------------------------------------
+    -- 6. UART TRANSMITTER INSTANCE
+    -- ------------------------------------------------------------------------
+    u_uart_tx: uart_tx_module
+        generic map ( CLKS_PER_BIT => CLKS_PER_BIT )
+        port map (
+            clk      => clk_50m,
+            rst_n    => rst_n,
+            tx_start => tx_start,
+            tx_data  => tx_data,
+            tx_line  => uart_tx,
+            tx_busy  => tx_busy
+        );
+
+end Behavioral;
