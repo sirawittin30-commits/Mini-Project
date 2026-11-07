@@ -1,0 +1,82 @@
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity uart_tx_module is
+    generic (
+        CLKS_PER_BIT : integer := 434
+    );
+    port (
+        clk      : in  std_logic;
+        rst_n    : in  std_logic;
+        tx_start : in  std_logic;
+        tx_data  : in  std_logic_vector(7 downto 0);
+        tx_line  : out std_logic;
+        tx_busy  : out std_logic
+    );
+end uart_tx_module;
+
+architecture Behavioral of uart_tx_module is
+    type state_type is (IDLE, START, DATA, STOP);
+    signal state     : state_type := IDLE;
+    signal clk_cnt   : integer range 0 to CLKS_PER_BIT := 0;
+    signal bit_idx   : integer range 0 to 7 := 0;
+    signal r_tx_data : std_logic_vector(7 downto 0) := (others => '0');
+begin
+
+    process(clk, rst_n)
+    begin
+        if rst_n = '0' then
+            state   <= IDLE;
+            tx_line <= '1';
+            tx_busy <= '0';
+        elsif rising_edge(clk) then
+            case state is
+                when IDLE =>
+                    tx_line <= '1';
+                    if tx_start = '1' then
+                        r_tx_data <= tx_data;
+                        tx_busy   <= '1';
+                        state     <= START;
+                        clk_cnt   <= 0;
+                    else
+                        tx_busy   <= '0';
+                    end if;
+
+                when START =>
+                    tx_line <= '0'; -- Start bit
+                    if clk_cnt < CLKS_PER_BIT - 1 then
+                        clk_cnt <= clk_cnt + 1;
+                    else
+                        clk_cnt <= 0;
+                        state   <= DATA;
+                        bit_idx <= 0;
+                    end if;
+
+                when DATA =>
+                    tx_line <= r_tx_data(bit_idx);
+                    if clk_cnt < CLKS_PER_BIT - 1 then
+                        clk_cnt <= clk_cnt + 1;
+                    else
+                        clk_cnt <= 0;
+                        if bit_idx < 7 then
+                            bit_idx <= bit_idx + 1;
+                        else
+                            state   <= STOP;
+                        end if;
+                    end if;
+
+                when STOP =>
+                    tx_line <= '1'; -- Stop bit
+                    if clk_cnt < CLKS_PER_BIT - 1 then
+                        clk_cnt <= clk_cnt + 1;
+                    else
+                        clk_cnt <= 0;
+                        state   <= IDLE;
+                        tx_busy <= '0';
+                    end if;
+            end case;
+        end if;
+    end process;
+
+end Behavioral;
